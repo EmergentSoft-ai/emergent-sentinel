@@ -1,0 +1,141 @@
+version: '3.8'
+
+# ═══════════════════════════════════════════════════════════════
+# SENTINEL MIND — docker-compose.yml (Production Hardened)
+# Levantá todo el stack con: docker-compose up -d
+# ═══════════════════════════════════════════════════════════════
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_DB:       sentinel_db
+      POSTGRES_USER:     sentinel
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - sentinel_internal          # Sin acceso a internet
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel_db"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+      start_period: 20s
+    # Hardening: sin puertos expuestos al host
+    expose:
+      - "5432"
+
+  # ── Python Scanner (FastAPI) ────────────────────────────────
+  scanner:
+    build:
+      context:    .
+      dockerfile: Dockerfile
+      target:     runtime
+    restart: always
+    environment:
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - INTERNAL_SERVICE_TOKEN=${INTERNAL_SERVICE_TOKEN}
+      - DATABASE_URL=postgresql://sentinel:${DB_PASSWORD}@db:5432/sentinel_db
+      - LOG_LEVEL=INFO
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - sentinel_internal
+    expose:
+      - "8000"                     # Solo visible para N8N y Nginx internamente
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; r=httpx.get('http://localhost:8000/health'); r.raise_for_status()"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 15s
+    # Límites de recursos — previene agotamiento en repos grandes
+    deploy:
+      resources:
+        limits:
+          cpus:   '1.0'
+          memory: 512M
+
+  # ── N8N Orchestrator ────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    restart: always
+    ports:
+      - "127.0.0.1:5678:5678"     # SOLO localhost — Nginx hace TLS proxy
+    environment:
+      - N8N_ENCRYPTION_KEY=${N8N_KEY}
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD}
+      - N8N_HOST=${N8N_HOST:-localhost}
+      - N8N_PROTOCOL=${N8N_PROTOCOL:-https}
+      - WEBHOOK_URL=https://${N8N_HOST}/
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - SCANNER_INTERNAL_URL=http://scanner:8000
+      - INTERNAL_SERVICE_TOKEN=${INTERNAL_SERVICE_TOKEN}
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=48
+      - N8N_LOG_LEVEL=warn
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      scanner:
+        condition: service_healthy
+    networks:
+      - sentinel_internal
+      - sentinel_external
+
+  # ── Nginx Reverse Proxy (TLS termination) ──────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/ssl/sentinel:ro    # Montá tus certs aquí (Let's Encrypt)
+    depends_on:
+      - n8n
+    networks:
+      - sentinel_external
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 60s
+      timeout:  5s
+      retries:  3
+
+volumes:
+  postgres_data:
+    driver: local
+  n8n_data:
+    driver: local
+
+networks:
+  # Red interna — SIN acceso a internet, solo comunicación entre servicios
+  sentinel_internal:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+  # Red externa — Solo Nginx y N8N para recibir webhooks
+  sentinel_external:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24
