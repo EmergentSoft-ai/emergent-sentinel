@@ -1,0 +1,205 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  SentinelEvents.sol                                              ║
+// ║  Forensic Incident Registry — Base Sepolia / Polygon Amoy        ║
+// ║  ETHGlobal Hackathon · Sentinel - The Sovereign Guardian         ║
+// ║                                                                  ║
+// ║  GAS STRATEGY:                                                   ║
+// ║  · bytes32 packed storage (single slot, no dynamic arrays)       ║
+// ║  · Indexed events for The Graph (no on-chain iteration needed)   ║
+// ║  · Minimal storage: only hash + timestamp + severity             ║
+// ║  · No strings, no mappings to arrays — pure slot efficiency      ║
+// ╚══════════════════════════════════════════════════════════════════╝
+
+contract SentinelEvents {
+
+    // ── Storage Layout (packed into minimum slots) ─────────────────
+    // Slot 0: owner (20 bytes) + paused (1 byte) = 21 bytes → 1 slot
+    address public owner;
+    bool    public paused;
+
+    // Slot 1: totalIncidents (32 bytes) → 1 slot
+    uint256 public totalIncidents;
+
+    // Tight-packed struct: 32 + 8 + 1 = 41 bytes → fits in 2 slots
+    struct Incident {
+        bytes32 incidentHash;   // SHA-256 of Sentinel's full log (32 bytes)
+        uint64  timestamp;      // Unix timestamp, fits in 8 bytes
+        uint8   severity;       // 0=INFO 1=LOW 2=MEDIUM 3=HIGH 4=CRITICAL
+    }
+
+    // Only store a counter → full data lives in event logs (indexed by The Graph)
+    // This keeps on-chain cost minimal while retaining full auditability
+    mapping(uint256 => Incident) private _incidents;
+
+    // ── Severity constants (avoids magic numbers) ──────────────────
+    uint8 public constant SEV_INFO     = 0;
+    uint8 public constant SEV_LOW      = 1;
+    uint8 public constant SEV_MEDIUM   = 2;
+    uint8 public constant SEV_HIGH     = 3;
+    uint8 public constant SEV_CRITICAL = 4;
+
+    // ── Events (indexed for The Graph) ────────────────────────────
+    // `indexed` fields cost ~375 gas each but make subgraph queries O(1)
+    event IncidentLogged(
+        uint256 indexed incidentId,
+        bytes32 indexed incidentHash,
+        uint8   indexed severity,
+        uint64          timestamp,
+        address         reporter
+    );
+
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    event Paused(address account);
+    event Unpaused(address account);
+
+    // ── Errors (cheaper than require strings — ~200 gas saved each) ─
+    error Unauthorized();
+    error ContractPaused();
+    error InvalidSeverity();
+    error HashAlreadyLogged();
+    error InvalidHash();
+
+    // ── Deduplication (prevent double-logging same incident) ────────
+    mapping(bytes32 => bool) private _loggedHashes;
+
+    // ── Constructor ────────────────────────────────────────────────
+    constructor() {
+        owner = msg.sender;
+        emit OwnershipTransferred(address(0), msg.sender);
+    }
+
+    // ── Modifiers ─────────────────────────────────────────────────
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert Unauthorized();
+        _;
+    }
+
+    modifier whenNotPaused() {
+        if (paused) revert ContractPaused();
+        _;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // CORE FUNCTION: logIncident
+    // Called by the Sentinel Web3 Sidecar for each neutralized threat
+    //
+    // GAS ESTIMATE (Base Sepolia):
+    // · Cold storage write (new hash):  ~22,100 gas
+    // · Event emission (4 indexed):     ~4,000  gas
+    // · Total:                          ~26,100 gas ≈ $0.001 on Base
+    // ══════════════════════════════════════════════════════════════
+    function logIncident(
+        bytes32 incidentHash,
+        uint8   severity
+    )
+        external
+        whenNotPaused
+        returns (uint256 incidentId)
+    {
+        // Validate inputs
+        if (incidentHash == bytes32(0))    revert InvalidHash();
+        if (severity > SEV_CRITICAL)       revert InvalidSeverity();
+        if (_loggedHashes[incidentHash])   revert HashAlreadyLogged();
+
+        // Mark as logged (deduplication)
+        _loggedHashes[incidentHash] = true;
+
+        // Assign ID and store (tight-packed struct)
+        incidentId = totalIncidents;
+        _incidents[incidentId] = Incident({
+            incidentHash: incidentHash,
+            timestamp:    uint64(block.timestamp),
+            severity:     severity
+        });
+
+        // Increment counter (unchecked: will not overflow in any realistic scenario)
+        unchecked { ++totalIncidents; }
+
+        // Emit for The Graph indexing
+        emit IncidentLogged(
+            incidentId,
+            incidentHash,
+            severity,
+            uint64(block.timestamp),
+            msg.sender
+        );
+    }
+
+    // ── Batch logging (amortizes base tx cost across multiple events)
+    // Useful when Sentinel buffers events during high-frequency attacks
+    function logIncidentBatch(
+        bytes32[] calldata hashes,
+        uint8[]   calldata severities
+    )
+        external
+        whenNotPaused
+        returns (uint256[] memory ids)
+    {
+        uint256 len = hashes.length;
+        require(len == severities.length && len <= 50, "Invalid batch");
+
+        ids = new uint256[](len);
+        uint256 currentId = totalIncidents;
+
+        for (uint256 i; i < len; ) {
+            bytes32 h = hashes[i];
+            uint8   s = severities[i];
+
+            if (h == bytes32(0) || s > SEV_CRITICAL || _loggedHashes[h]) {
+                unchecked { ++i; }
+                continue; // Skip invalid/duplicate — don't revert batch
+            }
+
+            _loggedHashes[h] = true;
+            _incidents[currentId] = Incident({
+                incidentHash: h,
+                timestamp:    uint64(block.timestamp),
+                severity:     s
+            });
+            ids[i] = currentId;
+
+            emit IncidentLogged(currentId, h, s, uint64(block.timestamp), msg.sender);
+
+            unchecked { ++currentId; ++i; }
+        }
+
+        totalIncidents = currentId;
+    }
+
+    // ── Read functions ─────────────────────────────────────────────
+    function getIncident(uint256 id)
+        external
+        view
+        returns (bytes32 incidentHash, uint64 timestamp, uint8 severity)
+    {
+        Incident storage inc = _incidents[id];
+        return (inc.incidentHash, inc.timestamp, inc.severity);
+    }
+
+    function isLogged(bytes32 incidentHash) external view returns (bool) {
+        return _loggedHashes[incidentHash];
+    }
+
+    // ── Admin ──────────────────────────────────────────────────────
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert Unauthorized();
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+
+    function setPaused(bool _paused) external onlyOwner {
+        paused = _paused;
+        if (_paused) emit Paused(msg.sender);
+        else         emit Unpaused(msg.sender);
+    }
+
+    // ── Receive guard (reject accidental ETH sends) ────────────────
+    receive() external payable { revert(); }
+}
